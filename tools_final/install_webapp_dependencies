@@ -3,21 +3,30 @@
 
 # install_webapp_dependencies.sh
 #
-# Makes sure Node.js and npm are available (installing them from Debian's
-# apt repositories if they are missing), checks that Node is new enough, then
-# installs the monorepo's workspace dependencies.
+# The ONLY script in this toolset that installs anything. It makes sure that
+# Node.js, npm and git are available (installing missing ones from Debian's
+# apt repositories), checks that Node is new enough, installs the monorepo's
+# workspace dependencies, and makes sure Cloudflare's Wrangler CLI is
+# available and runs. The other four scripts (create_webapp_repo.sh,
+# test_new_webapp_repo.sh, scaffold_webapp_edge.sh, deploy_webapp_edge.sh)
+# only check that what they need is installed; when something is missing they
+# print an error to stderr and exit 1, pointing here.
 #
 # Design notes:
 #   - This script never changes directory. The project is targeted with
 #     "npm --prefix <dir>", which makes npm treat <dir> as the project root.
 #   - All messages (errors and status) go to stderr, and so does the output of
-#     the tools it runs (apt-get, npm), so stdout is left empty.
+#     the tools it runs (apt-get, npm, wrangler), so stdout is left empty.
 #   - Any failure exits with a non-zero status (set -eu plus explicit checks).
 #   - Node comes from ONE source: Debian's own packages. The script does not
 #     run "npm install -g npm@latest": that rewrites files dpkg owns, can break
 #     on a later "apt upgrade", and makes installs non-reproducible. If Debian's
 #     Node is too old for the project, the script stops and says so instead of
 #     mixing in a second Node source (NodeSource, nvm).
+#   - Wrangler normally arrives with the workspace dependencies (it is a
+#     devDependency of apps/api). Only when the target has no apps/api
+#     workspace does the script fall back to a global install, pinned to
+#     WRANGLER_SPEC. Keep that spec in sync with apps/api/package.json.
 #   - The minimum Node version is read from the project's .nvmrc (the single
 #     source of truth, kept in sync with "engines" in package.json). If .nvmrc
 #     is missing or unparsable, the defaults below are used.
@@ -25,7 +34,7 @@
 #     (machine-generated JSON, not hand-edited) and node_modules/, so there is
 #     nothing to annotate and no companion files are needed.
 #
-# Usage: install_webapp_repos.sh [target_directory]   (default: current directory)
+# Usage: install_webapp_dependencies.sh [target_directory]   (default: current directory)
 
 set -eu
 
@@ -33,7 +42,11 @@ set -eu
 DEFAULT_NODE_MAJOR=20
 DEFAULT_NODE_MINOR=19
 
+# Used only for the global fallback; keep in sync with apps/api/package.json.
+WRANGLER_SPEC="wrangler@^4"
+
 TARGET_DIR="${1:-.}"
+WRANGLER_BIN=""
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -65,6 +78,25 @@ is_number() {
   esac
 }
 
+# find_wrangler: sets WRANGLER_BIN to the Wrangler to use (project-local first,
+# then global). Returns non-zero, with WRANGLER_BIN empty, if none is found.
+find_wrangler() {
+  for candidate in \
+    "$TARGET_DIR/node_modules/.bin/wrangler" \
+    "$TARGET_DIR/apps/api/node_modules/.bin/wrangler"
+  do
+    if [ -x "$candidate" ]; then
+      WRANGLER_BIN="$candidate"
+      return 0
+    fi
+  done
+  if WRANGLER_BIN="$(command -v wrangler 2>/dev/null)"; then
+    return 0
+  fi
+  WRANGLER_BIN=""
+  return 1
+}
+
 # --- Preconditions -----------------------------------------------------------
 
 [ -d "$TARGET_DIR" ] || die "Target directory '$TARGET_DIR' does not exist."
@@ -92,13 +124,18 @@ if [ -f "$TARGET_DIR/.nvmrc" ]; then
   fi
 fi
 
-# --- 1. Node.js and npm ------------------------------------------------------
+# --- 1. Node.js, npm and git -------------------------------------------------
 
-if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
-  say "Node.js and/or npm not found. Installing from Debian packages..."
+missing_packages=""
+command -v node >/dev/null 2>&1 || missing_packages="$missing_packages nodejs"
+command -v npm >/dev/null 2>&1 || missing_packages="$missing_packages npm"
+command -v git >/dev/null 2>&1 || missing_packages="$missing_packages git"
+
+if [ -n "$missing_packages" ]; then
+  say "Missing tools; installing from Debian packages:$missing_packages"
 
   command -v apt-get >/dev/null 2>&1 ||
-    die "apt-get not found. This script supports Debian-based systems; install Node.js >= $min_major.$min_minor and npm manually."
+    die "apt-get not found. This script supports Debian-based systems; install Node.js >= $min_major.$min_minor, npm and git manually."
 
   if [ "$(id -u)" -ne 0 ]; then
     command -v sudo >/dev/null 2>&1 ||
@@ -107,13 +144,16 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   fi
 
   as_root apt-get update >&2 || die "apt-get update failed."
-  as_root apt-get install -y --no-install-recommends nodejs npm >&2 ||
-    die "Failed to install nodejs and npm via apt-get."
+  # $missing_packages is intentionally unquoted: it is a list of package names.
+  # shellcheck disable=SC2086
+  as_root apt-get install -y --no-install-recommends $missing_packages >&2 ||
+    die "Failed to install$missing_packages via apt-get."
 
   command -v node >/dev/null 2>&1 || die "node is still missing after installation."
   command -v npm >/dev/null 2>&1 || die "npm is still missing after installation."
+  command -v git >/dev/null 2>&1 || die "git is still missing after installation."
 else
-  say "Node.js and npm are already installed."
+  say "Node.js, npm and git are already installed."
 fi
 
 # --- 2. Verify the Node version ----------------------------------------------
@@ -155,6 +195,31 @@ fi
 
 [ -f "$TARGET_DIR/package-lock.json" ] ||
   say "Note: no package-lock.json was produced; commit one for reproducible installs."
+
+# --- 4. Cloudflare Wrangler --------------------------------------------------
+
+if find_wrangler; then
+  say "Wrangler is available: $WRANGLER_BIN"
+elif [ -d "$TARGET_DIR/apps/api" ]; then
+  # The workspace install above should have provided it.
+  die "Workspace dependencies were installed but wrangler is still missing. Check that apps/api/package.json lists wrangler in devDependencies."
+else
+  say "Target directory is not a monorepo workspace. Installing $WRANGLER_SPEC globally..."
+  if [ "$(id -u)" -ne 0 ]; then
+    command -v sudo >/dev/null 2>&1 ||
+      die "Root privileges are required for a global install, but sudo was not found. Re-run as root."
+    say "Root privileges required for a global install. Using sudo..."
+  fi
+  as_root npm install -g "$WRANGLER_SPEC" >&2 ||
+    die "Failed to install wrangler globally."
+  find_wrangler || die "wrangler is still not available after installation."
+fi
+
+# Run it, so a broken or incompatible install is reported instead of passing silently.
+if ! wrangler_version="$("$WRANGLER_BIN" --version 2>&1)"; then
+  die "wrangler was found at '$WRANGLER_BIN' but failed to run: $wrangler_version"
+fi
+say "Using wrangler at '$WRANGLER_BIN': $wrangler_version"
 
 say "Dependency setup and verification complete."
 say "Next, from inside '$TARGET_DIR': npm run check"
