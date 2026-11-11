@@ -1,0 +1,128 @@
+#!/usr/bin/env sh
+#Copyright (C) 2026 by Theron Kauk and John Morris Beck <hdconfigure.direct@gmail.com> THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# deploy_webapp_edge.sh
+#
+# Deploys the API Worker (apps/api) to Cloudflare. Before deploying it checks
+# that the toolchain is present and runs the repo's own "npm run check"
+# (typecheck, layer boundaries, annotated companions), so a broken tree is
+# never shipped. The web app is not deployed by this script.
+#
+# Design notes:
+#   - This script never changes directory. The project is targeted with
+#     "npm --prefix <dir>"; npm runs the API workspace's own "deploy" script
+#     from inside that workspace.
+#   - All messages (errors and status) go to stderr, and so does the output of
+#     the tools it runs (npm, wrangler), so stdout is left empty.
+#   - Any failure exits with a non-zero status (set -eu plus explicit checks).
+#   - The minimum Node version is read from the project's .nvmrc, with the
+#     defaults below as a fallback (same rule as scaffold_webapp_edge.sh).
+#   - Authentication is not handled here. Interactively, run
+#     "npx wrangler login" once. In CI, set CLOUDFLARE_API_TOKEN (and
+#     CLOUDFLARE_ACCOUNT_ID if the token covers several accounts).
+#   - This script writes no files of its own (Wrangler may create the
+#     git-ignored .wrangler/ directory), so there is nothing to annotate and no
+#     companion files are needed.
+#
+# Usage: deploy_webapp_edge.sh [target_directory]   (default: current directory)
+
+set -eu
+
+# Fallback minimum Node version, used only when .nvmrc cannot be read.
+DEFAULT_NODE_MAJOR=20
+DEFAULT_NODE_MINOR=19
+
+TARGET_DIR="${1:-.}"
+API_DIR="$TARGET_DIR/apps/api"
+API_WORKSPACE="@app/api"
+
+# --- Helpers -----------------------------------------------------------------
+
+# say <message>: status message to stderr
+say() {
+  echo "$@" >&2
+}
+
+# die <message>: error message to stderr, then exit with failure
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+# is_number <string>: succeeds if the string is a non-empty run of digits
+is_number() {
+  case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# --- Preconditions -----------------------------------------------------------
+
+[ -d "$TARGET_DIR" ] || die "Target directory '$TARGET_DIR' does not exist."
+
+[ -f "$TARGET_DIR/package.json" ] ||
+  die "'$TARGET_DIR' has no package.json. Run create_webapp_repo.sh first, or pass the project root."
+
+[ -d "$API_DIR" ] || die "API directory '$API_DIR' does not exist."
+
+[ -f "$API_DIR/wrangler.toml" ] ||
+  die "'$API_DIR/wrangler.toml' not found; the API Worker is not configured."
+
+command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 ||
+  die "Node.js and npm are required but not found. Run scaffold_webapp_edge.sh first."
+
+[ -d "$TARGET_DIR/node_modules" ] ||
+  die "Dependencies are not installed in '$TARGET_DIR'. Run scaffold_webapp_edge.sh first."
+
+# Minimum Node version: from .nvmrc ("20.19", "v20.19.2" or "20"), else defaults
+min_major="$DEFAULT_NODE_MAJOR"
+min_minor="$DEFAULT_NODE_MINOR"
+if [ -f "$TARGET_DIR/.nvmrc" ]; then
+  nvmrc_line=""
+  IFS= read -r nvmrc_line < "$TARGET_DIR/.nvmrc" || true
+  nvmrc_version="${nvmrc_line#v}"
+  nvmrc_major="${nvmrc_version%%.*}"
+  case "$nvmrc_version" in
+    *.*) nvmrc_rest="${nvmrc_version#*.}"; nvmrc_minor="${nvmrc_rest%%.*}" ;;
+    *) nvmrc_minor=0 ;;
+  esac
+  if is_number "$nvmrc_major" && is_number "$nvmrc_minor"; then
+    min_major="$nvmrc_major"
+    min_minor="$nvmrc_minor"
+  else
+    say "Warning: could not parse '$TARGET_DIR/.nvmrc'; requiring Node >= $min_major.$min_minor."
+  fi
+fi
+
+node_version="$(node --version)" || die "Could not run 'node --version'."
+version_digits="${node_version#v}"
+node_major="${version_digits%%.*}"
+version_rest="${version_digits#*.}"
+node_minor="${version_rest%%.*}"
+
+if ! is_number "$node_major" || ! is_number "$node_minor"; then
+  die "Could not parse Node version '$node_version'."
+fi
+
+if [ "$node_major" -lt "$min_major" ] ||
+   { [ "$node_major" -eq "$min_major" ] && [ "$node_minor" -lt "$min_minor" ]; }; then
+  die "Node $node_version is older than the required $min_major.$min_minor."
+fi
+
+# --- 1. Pre-deploy checks ----------------------------------------------------
+
+say "Running pre-deploy checks in '$TARGET_DIR'..."
+npm --prefix "$TARGET_DIR" run check >&2 ||
+  die "Pre-deploy checks failed (npm run check). Nothing was deployed."
+
+# --- 2. Deploy ---------------------------------------------------------------
+
+say "Initiating deployment for the API worker in '$API_DIR'..."
+
+if ! npm --prefix "$TARGET_DIR" run deploy --workspace="$API_WORKSPACE" >&2; then
+  say "Hint: authenticate first with 'npx wrangler login', or set CLOUDFLARE_API_TOKEN for non-interactive use."
+  die "Failed to deploy the API worker to Cloudflare edge."
+fi
+
+say "API worker deployment completed successfully."
