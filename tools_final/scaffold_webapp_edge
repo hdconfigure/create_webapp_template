@@ -3,29 +3,25 @@
 
 # scaffold_webapp_edge.sh
 #
-# Makes sure Cloudflare's Wrangler CLI is available and actually runs. It looks
-# for a project-local Wrangler first (the monorepo's apps/api devDependency,
-# usually hoisted to the root node_modules), then a global one. If neither
-# exists it installs one: through the monorepo's workspace dependencies when the
-# target is the monorepo, or globally otherwise. Normally
-# install_webapp_repos.sh has already installed Wrangler with the workspace
-# dependencies, in which case this script only verifies it.
+# Verifies that Cloudflare's Wrangler CLI is available and actually runs. It
+# looks for a project-local Wrangler first (the monorepo's apps/api
+# devDependency, usually hoisted to the root node_modules), then a global one.
+# This script installs nothing: if Node.js or Wrangler is missing it prints an
+# error to stderr and exits 1. Run install_webapp_dependencies.sh to install
+# them.
 #
 # Design notes:
-#   - This script never changes directory. The project is targeted with
-#     "npm --prefix <dir>", and Wrangler is run by its path.
+#   - This script never changes directory. Wrangler is run by its path.
 #   - All messages (errors and status) go to stderr, and so does the output of
-#     the tools it runs (npm, wrangler), so stdout is left empty.
+#     the tools it runs (wrangler), so stdout is left empty.
 #   - Any failure exits with a non-zero status (set -eu plus explicit checks).
 #   - Unlike a check that only looks for a file, this script runs
 #     "wrangler --version" at the end, so a broken or incompatible install is
 #     reported instead of passing silently.
-#   - The global fallback installs a pinned major version (WRANGLER_SPEC) so it
-#     matches the monorepo's wrangler range; keep the two in sync.
 #   - The minimum Node version is read from the project's .nvmrc, with the
-#     defaults below as a fallback (same rule as install_webapp_repos.sh).
+#     defaults below as a fallback (same rule as install_webapp_dependencies.sh).
 #   - This script writes no files of its own, so there is nothing to annotate
-#     and no companion files are needed. (npm may update package-lock.json.)
+#     and no companion files are needed.
 #
 # Usage: scaffold_webapp_edge.sh [target_directory]   (default: current directory)
 
@@ -34,9 +30,6 @@ set -eu
 # Fallback minimum Node version, used only when .nvmrc cannot be read.
 DEFAULT_NODE_MAJOR=20
 DEFAULT_NODE_MINOR=19
-
-# Used only for the global fallback; keep in sync with apps/api/package.json.
-WRANGLER_SPEC="wrangler@^4"
 
 TARGET_DIR="${1:-.}"
 WRANGLER_BIN=""
@@ -52,15 +45,6 @@ say() {
 die() {
   echo "Error: $*" >&2
   exit 1
-}
-
-# as_root <command...>: run a command as root, using sudo when not already root
-as_root() {
-  if [ "$(id -u)" -eq 0 ]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
 }
 
 # is_number <string>: succeeds if the string is a non-empty run of digits
@@ -94,8 +78,8 @@ find_wrangler() {
 
 [ -d "$TARGET_DIR" ] || die "Target directory '$TARGET_DIR' does not exist."
 
-command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 ||
-  die "Node.js and npm are required but not found. Run install_webapp_repos.sh first."
+command -v node >/dev/null 2>&1 ||
+  die "node is required but was not found. Run install_webapp_dependencies.sh first."
 
 # Minimum Node version: from .nvmrc ("20.19", "v20.19.2" or "20"), else defaults
 min_major="$DEFAULT_NODE_MAJOR"
@@ -132,32 +116,12 @@ if [ "$node_major" -lt "$min_major" ] ||
   die "Node $node_version is older than the required $min_major.$min_minor."
 fi
 
-# --- 1. Find or install Wrangler ---------------------------------------------
+# --- 1. Find Wrangler --------------------------------------------------------
 
-if find_wrangler; then
-  say "Wrangler dependency is already installed: $WRANGLER_BIN"
-else
-  say "Wrangler dependency not found."
+find_wrangler ||
+  die "wrangler was not found (looked in '$TARGET_DIR/node_modules/.bin', '$TARGET_DIR/apps/api/node_modules/.bin' and PATH). Run install_webapp_dependencies.sh first."
 
-  if [ -d "$TARGET_DIR/apps/api" ]; then
-    [ -f "$TARGET_DIR/package.json" ] ||
-      die "'$TARGET_DIR' has no package.json. Run create_webapp_repo.sh first, or pass the project root."
-    say "Installing workspace dependencies (including wrangler) in '$TARGET_DIR'..."
-    npm --prefix "$TARGET_DIR" install >&2 ||
-      die "Failed to install workspace dependencies and wrangler."
-  else
-    say "Target directory is not a monorepo workspace. Installing $WRANGLER_SPEC globally..."
-    if [ "$(id -u)" -ne 0 ]; then
-      command -v sudo >/dev/null 2>&1 ||
-        die "Root privileges are required for a global install, but sudo was not found. Re-run as root."
-      say "Root privileges required for a global install. Using sudo..."
-    fi
-    as_root npm install -g "$WRANGLER_SPEC" >&2 ||
-      die "Failed to install wrangler globally."
-  fi
-
-  find_wrangler || die "wrangler is still not available after installation."
-fi
+say "Wrangler dependency is installed: $WRANGLER_BIN"
 
 # --- 2. Verify that Wrangler runs --------------------------------------------
 
