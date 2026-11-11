@@ -6,7 +6,11 @@
 # Tests a repo produced by create_webapp_repo.sh. It only reads the repo (apart
 # from the build output that "npm run build" writes to the git-ignored dist/).
 #
-# Static checks (always run):
+# Required before it starts (checked first; any missing item is an error on
+# stderr and exit 1): node, npm, git, and the repo's installed node_modules.
+# Install them with install_webapp_dependencies.sh. This script installs nothing.
+#
+# Checks:
 #   - expected files exist, including an annotated companion for each package.json
 #   - package.json files and tsconfig files parse (tsconfig // comment lines are stripped)
 #   - no "_comment_" keys and no pnpm-style "workspace:" dependencies
@@ -14,18 +18,15 @@
 #   - onion layer boundaries hold (check-boundaries.sh)
 #   - generated scripts keep stdout empty and never change directory
 #   - the directory is a git repo that ignores node_modules
-#
-# Dynamic checks (run only when node_modules exists, i.e. after
-# scaffold_webapp_edge.sh): lockfile present, "npm run check", "npm run build".
-# When dependencies are not installed these are reported as SKIP.
+#   - lockfile present, "npm run check", "npm run build"
 #
 # Design notes:
 #   - This script never changes directory. The repo is targeted with
 #     "git -C <dir>" and "npm --prefix <dir>".
 #   - All messages (errors and status) go to stderr, so stdout is left empty.
 #     Output from the tools it runs is captured and shown only when a check fails.
-#   - Exit status: 0 when every check passed (skips are allowed), 1 when any
-#     check failed or a precondition was not met.
+#   - Exit status: 0 when every check passed, 1 when any check failed or a
+#     precondition was not met.
 #   - It writes no files of its own, so there is nothing to annotate and no
 #     companion files are needed.
 #
@@ -37,7 +38,6 @@ TARGET_DIR="${1:-.}"
 
 passed=0
 failed=0
-skipped=0
 
 # --- Reporting helpers -------------------------------------------------------
 
@@ -62,11 +62,6 @@ fail() {
   if [ -n "${2:-}" ]; then
     printf '%s\n' "$2" | sed 's/^/        /' >&2
   fi
-}
-
-skip() {
-  skipped=$((skipped + 1))
-  say "  SKIP  $1"
 }
 
 # run_check <description> <command...>: passes when the command succeeds
@@ -122,11 +117,18 @@ no_directory_change() { # <relative_path>
   fi
 }
 
-# --- Preconditions -----------------------------------------------------------
+# --- Preconditions: everything this script uses must already be installed ----
 
 [ -d "$TARGET_DIR" ] || die "Target directory '$TARGET_DIR' does not exist."
+
 command -v node >/dev/null 2>&1 ||
-  die "node is required to run these tests. Run scaffold_webapp_edge.sh first."
+  die "node is required but was not found. Run install_webapp_dependencies.sh first."
+command -v npm >/dev/null 2>&1 ||
+  die "npm is required but was not found. Run install_webapp_dependencies.sh first."
+command -v git >/dev/null 2>&1 ||
+  die "git is required but was not found. Run install_webapp_dependencies.sh first."
+[ -d "$TARGET_DIR/node_modules" ] ||
+  die "Dependencies are not installed in '$TARGET_DIR' (no node_modules). Run install_webapp_dependencies.sh first."
 
 say "Testing new webapp repo in '$TARGET_DIR'..."
 
@@ -174,31 +176,19 @@ run_check "check-annotated.mjs never changes directory" no_directory_change scri
 # --- 4. Git ------------------------------------------------------------------
 
 say "Git:"
-if command -v git >/dev/null 2>&1; then
-  run_check "is a git work tree" git -C "$TARGET_DIR" rev-parse --is-inside-work-tree
-  run_check "node_modules is git-ignored" git -C "$TARGET_DIR" check-ignore -q node_modules/
-else
-  skip "git not installed; skipping git checks"
-fi
+run_check "is a git work tree" git -C "$TARGET_DIR" rev-parse --is-inside-work-tree
+run_check "node_modules is git-ignored" git -C "$TARGET_DIR" check-ignore -q node_modules/
 
-# --- 5. Dependencies installed: lockfile, typecheck, build -------------------
+# --- 5. Installed dependencies: lockfile, typecheck, build -------------------
 
 say "Installed dependencies:"
-if [ -d "$TARGET_DIR/node_modules" ]; then
-  if command -v npm >/dev/null 2>&1; then
-    run_check "package-lock.json present (commit it)" file_exists package-lock.json
-    run_check "npm run check (typecheck, boundaries, companions)" npm --prefix "$TARGET_DIR" run check
-    run_check "npm run build (web bundle)" npm --prefix "$TARGET_DIR" run build
-  else
-    fail "node_modules exists but npm was not found"
-  fi
-else
-  skip "node_modules not found; run scaffold_webapp_edge.sh to enable lockfile, typecheck and build checks"
-fi
+run_check "package-lock.json present (commit it)" file_exists package-lock.json
+run_check "npm run check (typecheck, boundaries, companions)" npm --prefix "$TARGET_DIR" run check
+run_check "npm run build (web bundle)" npm --prefix "$TARGET_DIR" run build
 
 # --- Summary -----------------------------------------------------------------
 
-say "Results: $passed passed, $failed failed, $skipped skipped."
+say "Results: $passed passed, $failed failed."
 
 if [ "$failed" -gt 0 ]; then
   exit 1
