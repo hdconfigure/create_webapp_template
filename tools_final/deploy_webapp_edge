@@ -4,9 +4,13 @@
 # deploy_webapp_edge.sh
 #
 # Deploys the API Worker (apps/api) to Cloudflare. Before deploying it checks
-# that the toolchain is present and runs the repo's own "npm run check"
-# (typecheck, layer boundaries, annotated companions), so a broken tree is
-# never shipped. The web app is not deployed by this script.
+# that the toolchain is installed (node, npm, node_modules, wrangler) and runs
+# the repo's own "npm run check" (typecheck, layer boundaries, annotated
+# companions), so a broken tree is never shipped. The web app is not deployed
+# by this script.
+#
+# This script installs nothing. If a dependency is missing it prints an error
+# to stderr and exits 1; run install_webapp_dependencies.sh to install it.
 #
 # Design notes:
 #   - This script never changes directory. The project is targeted with
@@ -16,7 +20,7 @@
 #     the tools it runs (npm, wrangler), so stdout is left empty.
 #   - Any failure exits with a non-zero status (set -eu plus explicit checks).
 #   - The minimum Node version is read from the project's .nvmrc, with the
-#     defaults below as a fallback (same rule as scaffold_webapp_edge.sh).
+#     defaults below as a fallback (same rule as install_webapp_dependencies.sh).
 #   - Authentication is not handled here. Interactively, run
 #     "npx wrangler login" once. In CI, set CLOUDFLARE_API_TOKEN (and
 #     CLOUDFLARE_ACCOUNT_ID if the token covers several accounts).
@@ -35,6 +39,7 @@ DEFAULT_NODE_MINOR=19
 TARGET_DIR="${1:-.}"
 API_DIR="$TARGET_DIR/apps/api"
 API_WORKSPACE="@app/api"
+WRANGLER_BIN=""
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -57,6 +62,25 @@ is_number() {
   esac
 }
 
+# find_wrangler: sets WRANGLER_BIN to the Wrangler to use (project-local first,
+# then global). Returns non-zero, with WRANGLER_BIN empty, if none is found.
+find_wrangler() {
+  for candidate in \
+    "$TARGET_DIR/node_modules/.bin/wrangler" \
+    "$TARGET_DIR/apps/api/node_modules/.bin/wrangler"
+  do
+    if [ -x "$candidate" ]; then
+      WRANGLER_BIN="$candidate"
+      return 0
+    fi
+  done
+  if WRANGLER_BIN="$(command -v wrangler 2>/dev/null)"; then
+    return 0
+  fi
+  WRANGLER_BIN=""
+  return 1
+}
+
 # --- Preconditions -----------------------------------------------------------
 
 [ -d "$TARGET_DIR" ] || die "Target directory '$TARGET_DIR' does not exist."
@@ -69,11 +93,16 @@ is_number() {
 [ -f "$API_DIR/wrangler.toml" ] ||
   die "'$API_DIR/wrangler.toml' not found; the API Worker is not configured."
 
-command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 ||
-  die "Node.js and npm are required but not found. Run scaffold_webapp_edge.sh first."
+command -v node >/dev/null 2>&1 ||
+  die "node is required but was not found. Run install_webapp_dependencies.sh first."
+command -v npm >/dev/null 2>&1 ||
+  die "npm is required but was not found. Run install_webapp_dependencies.sh first."
 
 [ -d "$TARGET_DIR/node_modules" ] ||
-  die "Dependencies are not installed in '$TARGET_DIR'. Run scaffold_webapp_edge.sh first."
+  die "Dependencies are not installed in '$TARGET_DIR' (no node_modules). Run install_webapp_dependencies.sh first."
+
+find_wrangler ||
+  die "wrangler was not found (looked in '$TARGET_DIR/node_modules/.bin', '$TARGET_DIR/apps/api/node_modules/.bin' and PATH). Run install_webapp_dependencies.sh first."
 
 # Minimum Node version: from .nvmrc ("20.19", "v20.19.2" or "20"), else defaults
 min_major="$DEFAULT_NODE_MAJOR"
