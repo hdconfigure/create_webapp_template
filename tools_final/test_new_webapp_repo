@@ -1,0 +1,205 @@
+#!/usr/bin/env sh
+#Copyright (C) 2026 by Theron Kauk and John Morris Beck <hdconfigure.direct@gmail.com> THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# test_new_webapp_repo.sh
+#
+# Tests a repo produced by create_webapp_repo.sh. It only reads the repo (apart
+# from the build output that "npm run build" writes to the git-ignored dist/).
+#
+# Static checks (always run):
+#   - expected files exist, including an annotated companion for each package.json
+#   - package.json files and tsconfig files parse (tsconfig // comment lines are stripped)
+#   - no "_comment_" keys and no pnpm-style "workspace:" dependencies
+#   - annotated companions match their real package.json (check-annotated.mjs)
+#   - onion layer boundaries hold (check-boundaries.sh)
+#   - generated scripts keep stdout empty and never change directory
+#   - the directory is a git repo that ignores node_modules
+#
+# Dynamic checks (run only when node_modules exists, i.e. after
+# scaffold_webapp_edge.sh): lockfile present, "npm run check", "npm run build".
+# When dependencies are not installed these are reported as SKIP.
+#
+# Design notes:
+#   - This script never changes directory. The repo is targeted with
+#     "git -C <dir>" and "npm --prefix <dir>".
+#   - All messages (errors and status) go to stderr, so stdout is left empty.
+#     Output from the tools it runs is captured and shown only when a check fails.
+#   - Exit status: 0 when every check passed (skips are allowed), 1 when any
+#     check failed or a precondition was not met.
+#   - It writes no files of its own, so there is nothing to annotate and no
+#     companion files are needed.
+#
+# Usage: test_new_webapp_repo.sh [target_directory]   (default: current directory)
+
+set -eu
+
+TARGET_DIR="${1:-.}"
+
+passed=0
+failed=0
+skipped=0
+
+# --- Reporting helpers -------------------------------------------------------
+
+say() {
+  echo "$@" >&2
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+pass() {
+  passed=$((passed + 1))
+  say "  PASS  $1"
+}
+
+# fail <description> [detail]
+fail() {
+  failed=$((failed + 1))
+  say "  FAIL  $1"
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed 's/^/        /' >&2
+  fi
+}
+
+skip() {
+  skipped=$((skipped + 1))
+  say "  SKIP  $1"
+}
+
+# run_check <description> <command...>: passes when the command succeeds
+run_check() {
+  description=$1
+  shift
+  if output=$("$@" 2>&1); then
+    pass "$description"
+  else
+    fail "$description" "$output"
+  fi
+}
+
+# --- Check functions (each returns non-zero on failure) ----------------------
+
+file_exists() { # <relative_path>
+  [ -f "$TARGET_DIR/$1" ] || { echo "missing: $1"; return 1; }
+}
+
+json_valid() { # <relative_path>
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$TARGET_DIR/$1"
+}
+
+# tsconfig files may carry whole-line // comments
+jsonc_valid() { # <relative_path>
+  node -e '
+    const text = require("fs").readFileSync(process.argv[1], "utf8");
+    JSON.parse(text.split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n"));
+  ' "$TARGET_DIR/$1"
+}
+
+lacks_pattern() { # <extended-regex> <relative_path>
+  if matches=$(grep -nE "$1" "$TARGET_DIR/$2"); then
+    echo "$2: $matches"
+    return 1
+  fi
+}
+
+quiet_stdout() { # <interpreter> <relative_script>
+  if ! combined=$("$1" "$TARGET_DIR/$2" 2>&1); then
+    echo "$2 exited with a failure status:"
+    echo "$combined"
+    return 1
+  fi
+  stdout_only=$("$1" "$TARGET_DIR/$2" 2>/dev/null) || true
+  [ -z "$stdout_only" ] || { echo "$2 wrote to stdout: $stdout_only"; return 1; }
+}
+
+no_directory_change() { # <relative_path>
+  if matches=$(grep -nE '(^|[;&| (])cd[ ]' "$TARGET_DIR/$1"); then
+    echo "$1: $matches"
+    return 1
+  fi
+}
+
+# --- Preconditions -----------------------------------------------------------
+
+[ -d "$TARGET_DIR" ] || die "Target directory '$TARGET_DIR' does not exist."
+command -v node >/dev/null 2>&1 ||
+  die "node is required to run these tests. Run scaffold_webapp_edge.sh first."
+
+say "Testing new webapp repo in '$TARGET_DIR'..."
+
+# --- 1. Expected files -------------------------------------------------------
+
+say "Files:"
+for path in \
+  .app_initialized .gitignore .nvmrc README.md \
+  package.json package.annotated.jsonc tsconfig.base.json \
+  scripts/check-boundaries.sh scripts/check-annotated.mjs \
+  packages/domain/package.json packages/domain/package.annotated.jsonc \
+  packages/domain/tsconfig.json packages/domain/src/index.ts \
+  apps/api/package.json apps/api/package.annotated.jsonc apps/api/tsconfig.json \
+  apps/api/wrangler.toml apps/api/src/index.ts \
+  apps/web/package.json apps/web/package.annotated.jsonc apps/web/tsconfig.json \
+  apps/web/vite.config.ts apps/web/index.html apps/web/src/main.ts
+do
+  run_check "exists: $path" file_exists "$path"
+done
+
+# --- 2. JSON validity and hygiene --------------------------------------------
+
+say "JSON:"
+for path in package.json apps/api/package.json apps/web/package.json packages/domain/package.json
+do
+  run_check "valid JSON: $path" json_valid "$path"
+  run_check "no _comment_ keys: $path" lacks_pattern '_comment_' "$path"
+  run_check "no pnpm workspace: protocol: $path" lacks_pattern '"workspace:' "$path"
+done
+
+for path in tsconfig.base.json apps/api/tsconfig.json apps/web/tsconfig.json packages/domain/tsconfig.json
+do
+  run_check "valid JSON (comments allowed): $path" jsonc_valid "$path"
+  run_check "no _comment_ keys: $path" lacks_pattern '_comment_' "$path"
+done
+
+# --- 3. Generated checks and conventions -------------------------------------
+
+say "Generated scripts:"
+run_check "annotated companions match their package.json" quiet_stdout node scripts/check-annotated.mjs
+run_check "layer boundaries hold" quiet_stdout sh scripts/check-boundaries.sh
+run_check "check-boundaries.sh never changes directory" no_directory_change scripts/check-boundaries.sh
+run_check "check-annotated.mjs never changes directory" no_directory_change scripts/check-annotated.mjs
+
+# --- 4. Git ------------------------------------------------------------------
+
+say "Git:"
+if command -v git >/dev/null 2>&1; then
+  run_check "is a git work tree" git -C "$TARGET_DIR" rev-parse --is-inside-work-tree
+  run_check "node_modules is git-ignored" git -C "$TARGET_DIR" check-ignore -q node_modules/
+else
+  skip "git not installed; skipping git checks"
+fi
+
+# --- 5. Dependencies installed: lockfile, typecheck, build -------------------
+
+say "Installed dependencies:"
+if [ -d "$TARGET_DIR/node_modules" ]; then
+  if command -v npm >/dev/null 2>&1; then
+    run_check "package-lock.json present (commit it)" file_exists package-lock.json
+    run_check "npm run check (typecheck, boundaries, companions)" npm --prefix "$TARGET_DIR" run check
+    run_check "npm run build (web bundle)" npm --prefix "$TARGET_DIR" run build
+  else
+    fail "node_modules exists but npm was not found"
+  fi
+else
+  skip "node_modules not found; run scaffold_webapp_edge.sh to enable lockfile, typecheck and build checks"
+fi
+
+# --- Summary -----------------------------------------------------------------
+
+say "Results: $passed passed, $failed failed, $skipped skipped."
+
+if [ "$failed" -gt 0 ]; then
+  exit 1
+fi
