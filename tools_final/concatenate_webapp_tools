@@ -19,4 +19,4 @@ concatenate_files_in_directory() {
         fi
     done
 }
-concatenate_files_in_directory "$HOME/.configure/hdconfigure/tools" install_webapp_dependencies create_new_webapp_repo test_new_webapp_repo scaffold_webapp_edge deploy_webapp_edge
+concatenate_files_in_directory "$HOME/.config/hdconfigure/tools" install_webapp_dependencies create_new_webapp_repo test_new_webapp_repo scaffold_webapp_edge deploy_webapp_edge
