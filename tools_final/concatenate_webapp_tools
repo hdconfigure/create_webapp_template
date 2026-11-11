@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 #Copyright (C) 2026 by Theron Kauk and John Morris Beck <hdconfigure.direct@gmail.com> THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 install_hd_tool hdconfigure create_webapp_template
-concatenate_webapp_tools() {
+concatenate_files_in_directory() {
     # Ensure at least a directory and one file are provided
     if [ "$#" -lt 2 ]; then
         echo "Usage: concatenate_webapp_tools <directory> <file1> [file2 ...]" >&2
@@ -19,4 +19,4 @@ concatenate_webapp_tools() {
         fi
     done
 }
-cat_webapp_tools "$HOME/.configure/hdconfigure/tools" install_webapp_dependencies create_new_webapp_repo test_new_weapp_repo scaffold_webapp_edge deploy_webapp_edge
+concatenate_files_in_directory "$HOME/.configure/hdconfigure/tools" install_webapp_dependencies create_new_webapp_repo test_new_weapp_repo scaffold_webapp_edge deploy_webapp_edge
