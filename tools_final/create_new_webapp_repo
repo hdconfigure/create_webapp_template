@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 #Copyright (C) 2026 by Theron Kauk and John Morris Beck <hdconfigure.direct@gmail.com> THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-# create_webapp_repo.sh
+# create_new_webapp_repo.sh
 #
 # Scaffolds an npm-workspaces monorepo:
 #   packages/domain  Fresh Onion core: pure TypeScript, zero runtime dependencies
@@ -9,6 +9,9 @@
 #   apps/web         Vite frontend
 #
 # Design notes:
+#   - This script installs nothing. It needs git; if git is missing it prints
+#     an error to stderr and exits 1. Run install_webapp_dependencies.sh to
+#     install git, Node.js, npm, the workspace dependencies and Wrangler.
 #   - This script never changes directory. Every path is built from the target
 #     directory argument, and git is pointed at it with "git init <dir>".
 #   - All messages (errors and status) go to stderr; stdout is left empty.
@@ -41,7 +44,7 @@ fi
 TARGET_DIR="$1"
 
 if ! command -v git >/dev/null 2>&1; then
-  echo "Error: git is required but was not found (Debian: sudo apt-get install git)." >&2
+  echo "Error: git is required but was not found. Run install_webapp_dependencies.sh first." >&2
   exit 1
 fi
 
@@ -297,6 +300,8 @@ npm workspaces monorepo targeting Cloudflare, developed on Debian stable.
 ## Setup
 
 Requires Node >= 20.19 (see `.nvmrc` and `engines`). Use a single Node source: either Debian's packaged Node or an upstream one (NodeSource, nvm), not both. Avoid running `npm install -g npm@latest` over a dpkg-managed Node.
+
+Installing is done only by `install_webapp_dependencies.sh` (Node.js, npm, git, workspace dependencies, Wrangler). The other scripts only check that these are present.
 
     npm install
     npm run dev:api     # Wrangler dev server on :8787
@@ -638,4 +643,4 @@ if ! git init "$TARGET_DIR" >/dev/null 2>&1; then
 fi
 
 echo "Scaffold initialization complete for '$TARGET_DIR'." >&2
-echo "Next, from inside '$TARGET_DIR': npm install && npm run check" >&2
+echo "Next, run install_webapp_dependencies.sh '$TARGET_DIR', then from inside '$TARGET_DIR': npm run check" >&2
