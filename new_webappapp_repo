@@ -1,0 +1,641 @@
+#!/usr/bin/env sh
+#Copyright (C) 2026 by Theron Kauk and John Morris Beck <hdconfigure.direct@gmail.com> THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# create_webapp_repo.sh
+#
+# Scaffolds an npm-workspaces monorepo:
+#   packages/domain  Fresh Onion core: pure TypeScript, zero runtime dependencies
+#   apps/api         Hono on Cloudflare Workers (transport layer)
+#   apps/web         Vite frontend
+#
+# Design notes:
+#   - This script never changes directory. Every path is built from the target
+#     directory argument, and git is pointed at it with "git init <dir>".
+#   - All messages (errors and status) go to stderr; stdout is left empty.
+#     The generated check scripts follow the same convention.
+#   - The domain package exports its TypeScript source directly. Vite and
+#     Wrangler (esbuild) both compile it, so there is no separate build step.
+#   - Comments in JSON:
+#       * tsconfig*.json files accept real // comments, so they are annotated
+#         inline. ("_comment_" keys there are a TS5023 compile error.)
+#       * package.json cannot carry comments, and "_comment_" keys inside
+#         dependencies/devDependencies make npm try to install them as
+#         packages. Each package.json therefore gets an annotated companion,
+#         package.annotated.jsonc, and scripts/check-annotated.mjs verifies the
+#         companion still matches the real file.
+#   - Local packages are referenced as "*" (npm workspaces link them);
+#     the "workspace:" protocol is pnpm/yarn only.
+#
+# Usage: create_webapp_repo.sh <target_directory>
+
+set -eu
+
+# --- Preconditions -----------------------------------------------------------
+
+if [ -z "${1:-}" ]; then
+  echo "Error: Target directory argument is required." >&2
+  echo "Usage: $0 <target_directory>" >&2
+  exit 1
+fi
+
+TARGET_DIR="$1"
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Error: git is required but was not found (Debian: sudo apt-get install git)." >&2
+  exit 1
+fi
+
+if [ -f "$TARGET_DIR/.app_initialized" ] || [ -f "$TARGET_DIR/package.json" ]; then
+  echo "WARNING: '$TARGET_DIR' already looks initialized (.app_initialized or package.json exists)." >&2
+  echo "Aborting to prevent overwriting existing work." >&2
+  exit 1
+fi
+
+# --- Helper ------------------------------------------------------------------
+
+# write_file <relative_path>   (file content is read from stdin)
+write_file() {
+  dest="$TARGET_DIR/$1"
+  if ! mkdir -p "$(dirname "$dest")" || ! cat > "$dest"; then
+    echo "Error: Failed to write '$dest'." >&2
+    exit 1
+  fi
+}
+
+mkdir -p "$TARGET_DIR/apps/web/src" \
+         "$TARGET_DIR/apps/api/src" \
+         "$TARGET_DIR/packages/domain/src" \
+         "$TARGET_DIR/scripts" || {
+  echo "Error: Failed to create directory structure in '$TARGET_DIR'." >&2
+  exit 1
+}
+
+# --- Root --------------------------------------------------------------------
+
+write_file package.json <<'EOF'
+{
+  "name": "@app/monorepo",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev:api": "npm run dev -w @app/api",
+    "dev:web": "npm run dev -w @app/web",
+    "build": "npm run build -w @app/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "check:boundaries": "sh scripts/check-boundaries.sh",
+    "check:annotated": "node scripts/check-annotated.mjs",
+    "check": "npm run typecheck && npm run check:boundaries && npm run check:annotated",
+    "deploy:api": "npm run deploy -w @app/api"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
+EOF
+
+write_file package.annotated.jsonc <<'EOF'
+// Annotated companion of package.json. Not read by any tool.
+// Keep it identical to package.json apart from whole-line // comments;
+// `npm run check:annotated` fails if the two drift apart.
+{
+  // Root workspace identifier for the monorepo
+  "name": "@app/monorepo",
+  // Prevents the root package from being published to npm by accident
+  "private": true,
+  // Glob patterns for local workspace packages managed by npm
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  // Minimum Node version; keep in sync with .nvmrc
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    // Wrangler dev server for the API (port 8787)
+    "dev:api": "npm run dev -w @app/api",
+    // Vite dev server for the frontend (port 3000, proxies /api to 8787)
+    "dev:web": "npm run dev -w @app/web",
+    // Type-checks and builds the production web bundle
+    "build": "npm run build -w @app/web",
+    // Runs each workspace's typecheck script, skipping ones without one
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    // Fails if the onion layering rules are violated
+    "check:boundaries": "sh scripts/check-boundaries.sh",
+    // Fails if a *.annotated.jsonc companion no longer matches its .json file
+    "check:annotated": "node scripts/check-annotated.mjs",
+    // Everything above in one command; run before committing
+    "check": "npm run typecheck && npm run check:boundaries && npm run check:annotated",
+    // Deploys the API Worker to Cloudflare (run `npx wrangler login` once first)
+    "deploy:api": "npm run deploy -w @app/api"
+  },
+  "devDependencies": {
+    // TypeScript compiler, shared across workspaces
+    "typescript": "^5.0.0"
+  }
+}
+EOF
+
+write_file .nvmrc <<'EOF'
+20.19
+EOF
+
+# tsconfig files accept // comments, so shared options are documented inline.
+write_file tsconfig.base.json <<'EOF'
+{
+  "compilerOptions": {
+    // JavaScript language version the code is written against
+    "target": "ES2022",
+    // Module syntax; the bundlers (Vite, Wrangler/esbuild) handle output
+    "module": "ESNext",
+    // Resolve imports the way modern bundlers do (honors package "exports")
+    "moduleResolution": "Bundler",
+    // Default runtime library; apps override this (DOM for web, none extra for api)
+    "lib": ["ES2022"],
+
+    // Enable all strict type-checking options
+    "strict": true,
+    // Indexed access (arr[0], obj[key]) may be undefined
+    "noUncheckedIndexedAccess": true,
+    // Every file must be safe to transpile on its own (required by esbuild/Vite)
+    "isolatedModules": true,
+    // Catch imports that only work on case-insensitive file systems
+    "forceConsistentCasingInFileNames": true,
+
+    // TypeScript only type-checks; bundlers do the emitting
+    "noEmit": true,
+    // Skip type-checking third-party .d.ts files to speed up checks
+    "skipLibCheck": true
+  }
+}
+EOF
+
+write_file .gitignore <<'EOF'
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env
+.env.*
+*.log
+.DS_Store
+EOF
+
+write_file scripts/check-boundaries.sh <<'EOF'
+#!/usr/bin/env sh
+# Fails if the onion layering is violated:
+#   domain -> imports nothing from apps or frameworks
+#   api    -> must not import web
+#   web    -> must not import api
+# Works from any directory: paths are derived from this script's location.
+set -eu
+
+root="$(dirname "$0")/.."
+status=0
+
+# check <dir> <extended-regex> <message>
+check() {
+  if matches=$(grep -rEn --include='*.ts' "$2" "$1" 2>/dev/null); then
+    echo "Boundary violation: $3" >&2
+    echo "$matches" >&2
+    status=1
+  fi
+}
+
+check "$root/packages/domain/src" "from ['\"](@app/(api|web)|hono|vite|@cloudflare)" \
+  "domain must not import apps or frameworks"
+check "$root/apps/api/src" "from ['\"]@app/web" "api must not import web"
+check "$root/apps/web/src" "from ['\"]@app/api" "web must not import api"
+
+if [ "$status" -eq 0 ]; then
+  echo "Layer boundaries OK." >&2
+fi
+exit "$status"
+EOF
+
+write_file scripts/check-annotated.mjs <<'EOF'
+// Verifies that every X.annotated.jsonc matches its sibling X.json once
+// whole-line // comments are removed. Comments must be on their own lines.
+// Works from any directory: paths are derived from this script's location.
+import { readFileSync, readdirSync } from "node:fs";
+import { join, dirname, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const skip = new Set(["node_modules", ".git", "dist", ".wrangler"]);
+
+function* walk(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (skip.has(entry.name)) continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) yield* walk(full);
+    else yield full;
+  }
+}
+
+const stripComments = (text) =>
+  text
+    .split("\n")
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join("\n");
+
+let checked = 0;
+let failed = false;
+
+for (const file of walk(root)) {
+  if (!file.endsWith(".annotated.jsonc")) continue;
+  checked += 1;
+  const realFile = file.replace(/\.annotated\.jsonc$/, ".json");
+  const shown = relative(root, file);
+  try {
+    const annotated = JSON.parse(stripComments(readFileSync(file, "utf8")));
+    const real = JSON.parse(readFileSync(realFile, "utf8"));
+    if (!isDeepStrictEqual(annotated, real)) {
+      console.error(`DRIFT: ${shown} differs from ${relative(root, realFile)}`);
+      failed = true;
+    }
+  } catch (err) {
+    console.error(`ERROR: ${shown}: ${err.message}`);
+    failed = true;
+  }
+}
+
+if (failed) process.exit(1);
+console.error(`Annotated companions OK (${checked} checked).`);
+EOF
+
+write_file README.md <<'EOF'
+# Web App Monorepo
+
+npm workspaces monorepo targeting Cloudflare, developed on Debian stable.
+
+| Path | Role |
+|---|---|
+| `packages/domain` | Fresh Onion core. Pure TypeScript, no runtime dependencies, no I/O, no clock or framework access. |
+| `apps/api` | Transport layer: Hono on Cloudflare Workers. |
+| `apps/web` | Vite frontend. |
+
+## Rules
+
+- `domain` imports nothing from `api`, `web`, Hono, Vite or Cloudflare. Time and other effects are passed in as arguments.
+- `api` and `web` may import `domain`, never each other.
+- `npm run check:boundaries` enforces this; `npm run check` also type-checks every package and verifies the annotated companions.
+- `domain` is consumed as TypeScript source (`exports` points at `src/index.ts`), so there is no build step for it.
+
+## Commented JSON
+
+- `tsconfig*.json` files carry real `//` comments (TypeScript allows them).
+- `package.json` cannot hold comments, so each has a companion `package.annotated.jsonc` with the same content plus `//` comments. Edit both together; `npm run check:annotated` fails if they drift apart. Comments must stay on their own lines.
+
+## Setup
+
+Requires Node >= 20.19 (see `.nvmrc` and `engines`). Use a single Node source: either Debian's packaged Node or an upstream one (NodeSource, nvm), not both. Avoid running `npm install -g npm@latest` over a dpkg-managed Node.
+
+    npm install
+    npm run dev:api     # Wrangler dev server on :8787
+    npm run dev:web     # Vite dev server on :3000, proxies /api to :8787
+
+## Deploy
+
+    npx wrangler login
+    npm run deploy:api
+
+Deploying the web app is not set up yet. Decide between Cloudflare Workers static assets and Pages, then add a script.
+
+## Notes
+
+- `apps/api/wrangler.toml`: `compatibility_date` is a deliberate setting. Review the Workers changelog before changing it, and test on a preview deployment first.
+- The dependency version ranges in the package.json files were chosen when this template was written. Run `npm outdated` and check release notes before relying on them.
+- Commit `package-lock.json` after the first `npm install`.
+EOF
+
+# --- packages/domain ---------------------------------------------------------
+
+write_file packages/domain/package.json <<'EOF'
+{
+  "name": "@app/domain",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc -p ."
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
+EOF
+
+write_file packages/domain/package.annotated.jsonc <<'EOF'
+// Annotated companion of package.json. Not read by any tool.
+// Keep it identical to package.json apart from whole-line // comments;
+// `npm run check:annotated` fails if the two drift apart.
+{
+  // Scoped workspace name; apps import this as "@app/domain"
+  "name": "@app/domain",
+  "version": "0.0.1",
+  // Prevents accidental publication to the public npm registry
+  "private": true,
+  // Treat .js files as ES modules
+  "type": "module",
+  // Consumers resolve the package to its TypeScript source; their bundlers
+  // (Vite, Wrangler/esbuild) compile it, so no build step or dist/ is needed
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  // Type entry point for editors and tsc
+  "types": "./src/index.ts",
+  "scripts": {
+    // Type-checks this package without emitting files
+    "typecheck": "tsc -p ."
+  },
+  "devDependencies": {
+    // TypeScript compiler. The domain has no runtime dependencies on purpose
+    "typescript": "^5.0.0"
+  }
+}
+EOF
+
+write_file packages/domain/tsconfig.json <<'EOF'
+{
+  // Inherit shared compiler options from the monorepo base config
+  "extends": "../../tsconfig.base.json",
+  // Only this package's source files are checked
+  "include": ["src/**/*"]
+}
+EOF
+
+write_file packages/domain/src/index.ts <<'EOF'
+export interface Greeting {
+  message: string;
+  timestamp: string;
+}
+
+/**
+ * Pure domain function: the current time is an input, not something the
+ * domain reaches out and grabs, so this is deterministic and easy to test.
+ */
+export function createGreeting(name: string, now: Date): Greeting {
+  const safeName = name.trim() === "" ? "World" : name.trim().slice(0, 100);
+  return {
+    message: `Hello, ${safeName}! Powered by Fresh Onion architecture.`,
+    timestamp: now.toISOString(),
+  };
+}
+EOF
+
+# --- apps/api ----------------------------------------------------------------
+
+write_file apps/api/package.json <<'EOF'
+{
+  "name": "@app/api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@app/domain": "*",
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.0.0",
+    "typescript": "^5.0.0",
+    "wrangler": "^4.0.0"
+  }
+}
+EOF
+
+write_file apps/api/package.annotated.jsonc <<'EOF'
+// Annotated companion of package.json. Not read by any tool.
+// Keep it identical to package.json apart from whole-line // comments;
+// `npm run check:annotated` fails if the two drift apart.
+{
+  // API service (Hono on Cloudflare Workers); the transport layer
+  "name": "@app/api",
+  "version": "0.0.1",
+  // Prevents accidental publication to the public npm registry
+  "private": true,
+  // Treat .js files as ES modules
+  "type": "module",
+  // Worker entry point (also set in wrangler.toml)
+  "main": "src/index.ts",
+  "scripts": {
+    // Local development server for the Worker
+    "dev": "wrangler dev",
+    // Deploys the Worker to Cloudflare (run `npx wrangler login` once first)
+    "deploy": "wrangler deploy",
+    // Type-checks this package without emitting files
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    // Local workspace package; npm links it (do not use the pnpm "workspace:" form)
+    "@app/domain": "*",
+    // Web framework for edge runtimes
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    // Global type definitions for the Workers runtime
+    "@cloudflare/workers-types": "^4.0.0",
+    // TypeScript compiler
+    "typescript": "^5.0.0",
+    // Cloudflare's CLI for developing and deploying Workers
+    "wrangler": "^4.0.0"
+  }
+}
+EOF
+
+write_file apps/api/tsconfig.json <<'EOF'
+{
+  // Inherit shared compiler options from the monorepo base config
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Workers have no DOM; only the standard JavaScript library
+    "lib": ["ES2022"],
+    // Global types for Workers bindings and runtime APIs
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": ["src/**/*"]
+}
+EOF
+
+write_file apps/api/src/index.ts <<'EOF'
+import { Hono } from "hono";
+import { createGreeting } from "@app/domain";
+
+const app = new Hono();
+
+app.get("/", (c) => {
+  const name = c.req.query("name") ?? "World";
+  return c.json(createGreeting(name, new Date()));
+});
+
+export default app;
+EOF
+
+write_file apps/api/wrangler.toml <<'EOF'
+name = "app-api"
+main = "src/index.ts"
+# Review the Workers changelog before bumping; test on a preview deployment.
+compatibility_date = "2026-01-01"
+EOF
+
+# --- apps/web ----------------------------------------------------------------
+
+write_file apps/web/package.json <<'EOF'
+{
+  "name": "@app/web",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p . && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@app/domain": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vite": "^7.0.0"
+  }
+}
+EOF
+
+write_file apps/web/package.annotated.jsonc <<'EOF'
+// Annotated companion of package.json. Not read by any tool.
+// Keep it identical to package.json apart from whole-line // comments;
+// `npm run check:annotated` fails if the two drift apart.
+{
+  // Frontend application built with Vite
+  "name": "@app/web",
+  "version": "0.0.1",
+  // Prevents accidental publication to the public npm registry
+  "private": true,
+  // Treat .js files as ES modules
+  "type": "module",
+  "scripts": {
+    // Local Vite dev server
+    "dev": "vite",
+    // Type-checks, then builds the production bundle into dist/
+    "build": "tsc -p . && vite build",
+    // Serves the built bundle locally for a final check
+    "preview": "vite preview",
+    // Type-checks this package without emitting files
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    // Local workspace package; npm links it (do not use the pnpm "workspace:" form)
+    "@app/domain": "*"
+  },
+  "devDependencies": {
+    // TypeScript compiler
+    "typescript": "^5.0.0",
+    // Frontend build tool and dev server
+    "vite": "^7.0.0"
+  }
+}
+EOF
+
+write_file apps/web/tsconfig.json <<'EOF'
+{
+  // Inherit shared compiler options from the monorepo base config
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Browser APIs plus modern JavaScript
+    "lib": ["DOM", "DOM.Iterable", "ES2022"]
+  },
+  // vite.config.ts is included so the config file is type-checked too
+  "include": ["src/**/*", "vite.config.ts"]
+}
+EOF
+
+write_file apps/web/vite.config.ts <<'EOF'
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  server: {
+    port: 3000,
+    proxy: {
+      "/api": {
+        target: "http://localhost:8787",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ""),
+      },
+    },
+  },
+});
+EOF
+
+write_file apps/web/index.html <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fresh Onion App</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+EOF
+
+write_file apps/web/src/main.ts <<'EOF'
+import { createGreeting } from "@app/domain";
+
+const root = document.getElementById("app");
+
+if (root) {
+  const data = createGreeting("Frontend User", new Date());
+
+  const wrapper = document.createElement("div");
+  wrapper.style.cssText =
+    "font-family: system-ui, sans-serif; padding: 2rem; max-width: 600px; margin: auto;";
+
+  const heading = document.createElement("h1");
+  heading.textContent = data.message;
+
+  const stamp = document.createElement("p");
+  const small = document.createElement("small");
+  small.textContent = `Timestamp: ${data.timestamp}`;
+  stamp.appendChild(small);
+
+  wrapper.append(heading, stamp);
+  root.replaceChildren(wrapper);
+}
+EOF
+
+# --- Finalize ----------------------------------------------------------------
+
+if ! echo "Initialized on $(date)" > "$TARGET_DIR/.app_initialized"; then
+  echo "Error: Failed to create initialization marker file." >&2
+  exit 1
+fi
+
+# Initialize git only after every file was written successfully
+if ! git init "$TARGET_DIR" >/dev/null 2>&1; then
+  echo "Error: Failed to initialize git repository in '$TARGET_DIR'." >&2
+  exit 1
+fi
+
+echo "Scaffold initialization complete for '$TARGET_DIR'." >&2
+echo "Next, from inside '$TARGET_DIR': npm install && npm run check" >&2
